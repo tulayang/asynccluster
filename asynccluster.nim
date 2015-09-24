@@ -1,51 +1,53 @@
-import asynchttpserver
-export asynchttpserver
-
-when defined(windows):
-    discard
-else:
-    import asyncpipe, osproc, os, posix, asyncdispatch, asyncnet, strutils
+when not defined(windows):
+    import asynchttp, asyncdispatch, asyncpipe, asyncnet, osproc, os, posix, strutils
     from rawsockets import setBlocking
 
     type
-        Worker* = ref object
-            prc*: Process
-            connections*: int
-            pipefd*: AsyncFD
-            slavefd*: AsyncFD
+        Worker* = ref object  ## Work process for http server instance.
+            prcocess: Process
+            connections: int
+            pipefd1: AsyncFD
+            pipefd2: AsyncFD
 
-        AsyncMaster = ref object
-            workers*: seq[Worker]
+        AsyncCluster = ref object  ## Cluster for manage workers.
+            workers: seq[Worker]
             maxConnections*: int
             connections*: int
             socket: AsyncSocket
             cores: int
             reuseAddr: bool
 
+    let isWorker* = existsEnv("CLUSTER_INSTANCE_ID")
+    let isMaster* = not isWorker
+
     proc newWorker*(id: int, first = false): Worker =  
-        var (pipefd, slavefd) = socketpair()
+        ## Creates a new worker.
+        var (pipefd1, pipefd2) = socketpair()
         putEnv("CLUSTER_INSTANCE_ID", $id)
         result.new()
-        result.pipefd = pipefd
-        result.pipefd.register()
-        result.pipefd.SocketHandle().setBlocking(false)
-        result.slavefd = slavefd
-        result.prc = if first: startProcess(paramStr(0), args = [$slavefd.int(), "0"])
-                     else: startProcess(paramStr(0), args = [$slavefd.int()]) 
+        result.pipefd1 = pipefd1
+        result.pipefd1.register()
+        result.pipefd1.SocketHandle().setBlocking(false)
+        result.pipefd2 = pipefd2
+        result.prcocess = if first: startProcess(paramStr(0), args = [$pipefd2.int(), "0"])
+                          else: startProcess(paramStr(0), args = [$pipefd2.int()]) 
 
     proc restartProcess*(x: Worker) =
-        x.prc.close()
-        x.prc = startProcess(paramStr(0), args = [$x.slavefd.int()])
+        ## Restarts the worker process, connections will be reset 0.
+        x.prcocess.close()
+        x.prcocess = startProcess(paramStr(0), args = [$x.pipefd2.int()])
         x.connections = 0
 
     proc close*(x: Worker) =
-        x.prc.kill()
-        x.prc.close()
-        x.pipefd.closeSocket()
-        discard x.slavefd.SocketHandle().close()
+        ## Closes the worker.
+        x.prcocess.kill()
+        x.prcocess.close()
+        x.pipefd1.closeSocket()
+        discard x.pipefd2.SocketHandle().close()
         x.connections = 0
 
-    proc newAsyncMaster*(cores: int, maxConnections = -1, reuseAddr = true): AsyncMaster = 
+    proc newAsyncCluster*(cores: int, maxConnections = 1000, reuseAddr = true): AsyncCluster = 
+        ## Creates a new asynchronous cluster manager.
         assert cores > 0
         result.new()
         result.cores = cores
@@ -54,84 +56,85 @@ else:
         result.socket = newAsyncSocket()
         result.maxConnections = maxConnections
         
-    proc selectWorker(master: AsyncMaster): Worker =
-        result = master.workers[0]
-        for worker in master.workers:
-            if worker.prc.running():
+    proc selectWorker(cluster: AsyncCluster): Worker =
+        result = cluster.workers[0]
+        for worker in cluster.workers:
+            if worker.prcocess.running():
                 if worker.connections == 0:
                     return worker 
                 if result.connections > worker.connections:
                     result = worker
             else:
-                master.connections.dec(worker.connections)
+                cluster.connections.dec(worker.connections)
                 worker.restartProcess()
-                echo ">> worker restart "
+                echo "restart"
                 return worker
 
-    proc recvStateAlways(master: AsyncMaster, worker: Worker) {.async.} =
+    proc recvStateAlways(cluster: AsyncCluster, index: int) {.async.} =
+        var worker = cluster.workers[index]
         while true:
-            var state = await worker.pipefd.recvState()
+            var state = await worker.pipefd1.recvState()
             case state
-            of ssUnknow: 
+            of hsUnknow: 
                 discard
-            of ssLimit: 
+            of hsLimit: 
                 worker.connections.dec()
-                master.connections.dec()
-            of ssAppend: 
+                cluster.connections.dec()
+            of hsAppend: 
                 discard
-            of ssClose: 
+            of hsClose: 
                 worker.connections.dec()
-                master.connections.dec()
+                cluster.connections.dec()
 
     proc sendHandleAndClose(fd: AsyncFD, handle: AsyncFD) {.async.} =
         await fd.sendHandle(handle)
         discard handle.SocketHandle().close()
 
-    proc acceptAlways(master: AsyncMaster) {.async.} =
+    proc acceptAlways(cluster: AsyncCluster) {.async.} =
         while true:
-            var fut = await master.socket.getFd().AsyncFD().acceptAddr()
-            master.connections.inc()
-            # if master.maxConnections > 0 and master.connections > master.maxConnections:
-            #     while true:
-            #         await sleepAsync(500)
-            #         if master.connections < master.maxConnections:
-            #             break
-            #echo "connections ===  master ", master.connections 
-            var worker = master.selectWorker()
-            worker.connections.inc()
-            asyncCheck worker.pipefd.sendHandleAndClose(fut.client)
+            if cluster.connections < cluster.maxConnections:
+                var fut = await cluster.socket.getFd().AsyncFD().acceptAddr()
+                var worker = cluster.selectWorker()
+                cluster.connections.inc()
+                worker.connections.inc()
+                asyncCheck worker.pipefd1.sendHandleAndClose(fut.client)
+            else:
+               await sleepAsync(0)
 
-    proc serve*(master: AsyncMaster) {.async.} =
+    proc serve*(cluster: AsyncCluster) {.async.} =
+        ## Starts the worker processes, and listening for incoming HTTP connections.
         assert existsEnv("CLUSTER_INSTANCE_ID") == false
 
-        for i in 0..master.cores-1:
-            master.workers[i] = newWorker(i, if i == 0: true else: false)
+        for i in 0..cluster.cores-1:
+            cluster.workers[i] = newWorker(i, if i == 0: true else: false)
 
-        var port = await master.workers[0].pipefd.recvLine()
-        var address = await master.workers[0].pipefd.recvLine()
+        var port = await cluster.workers[0].pipefd1.recvLine()
+        var address = await cluster.workers[0].pipefd1.recvLine()
 
-        for i in 0..master.cores-1:
-            asyncCheck master.recvStateAlways(master.workers[i])
+        for i in 0..cluster.cores-1:
+            asyncCheck cluster.recvStateAlways(i)
 
-        if master.reuseAddr:
-            master.socket.setSockOpt(OptReuseAddr, true)
-        master.socket.bindAddr(port.parseInt().Port(), address)
-        master.socket.listen()
-        asyncCheck master.acceptAlways()
+        if cluster.reuseAddr:
+            cluster.socket.setSockOpt(OptReuseAddr, true)
+        cluster.socket.bindAddr(port.parseInt().Port(), address)
+        cluster.socket.listen()
+        asyncCheck cluster.acceptAlways()
         
-when not defined(windows) and isMainModule:
+when isMainModule:
     if isWorker:
         proc cb(req: Request) {.async.} =
-            var arr: array[10000, int]
-            for i in 0..9999:
-                arr[i] = i
-            for i in 0..9999:
-                arr[i] += i * i
-            await req.respond(Http200, "Hello World!")
+            # var arr: array[10000, int]
+            # for i in 0..9999:
+            #     arr[i] = i
+            # for i in 0..9999:
+            #     arr[i] += i * i
+            await req.send(Http200, "Hello World!")
+
         var server = newAsyncHttpServer()
-        asyncCheck server.serve(Port(8000), cb, "127.0.0.1")
+        server.on("request", cb)
+        asyncCheck server.serve(Port(8000), "127.0.0.1")
         runForever()
     else:
-        var master = newAsyncMaster(2)
-        asyncCheck master.serve()
+        var cluster = newAsyncCluster(3)
+        asyncCheck cluster.serve()
         runForever()

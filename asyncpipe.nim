@@ -1,16 +1,18 @@
 when not defined(windows):
     import posix, asyncdispatch, os
-    from net import isDisconnectionError
 
     type
-        Fdmsg* = object of RootObj  ## A Tmsghdr wrapper for pass descriptorx. 
+        HandleMsg = ref object of RootObj
             buff: array[1, char]
-            iov: array[1, TIOVec]
+            iov: array[1, IOVec]
             cmsg: ptr Tcmsghdr
-            msg*: Tmsghdr
+            msg: Tmsghdr
 
-        WriteableFdmsg* = object of Fdmsg
-        ReadableFdmsg* = object of Fdmsg    
+        WriteableHandleMsg = ref object of HandleMsg
+        ReadableHandleMsg = ref object of HandleMsg
+
+        HandleState* = enum  ## State of currently descriptor.
+            hsUnknow = '0', hsLimit = '1', hsAppend = '2', hsClose = '3'
 
     proc CMSG_LEN*(length: Socklen): Socklen {.importc, header: "<sys/socket.h>".}
 
@@ -19,13 +21,14 @@ when not defined(windows):
         if socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0:
             result.pipefd1 = fds[0].AsyncFD()
             result.pipefd2 = fds[1].AsyncFD()
-        else:
-            raise newException(OSError, "Could not create socket pair.")
+        # else:
+        #     raise newException(OSError, "Could not create socket pair.")
 
-    let CmsgHandleLen* = CMSG_LEN(sizeof(SocketHandle).Socklen())
+    let CmsgHandleLen* = CMSG_LEN(sizeof(AsyncFD).Socklen())
 
-    template fdmsgImpl() =
-        result.iov[0].iov_base = result.buff.addr()
+    template handleMsgImpl() =
+        result.new()
+        result.iov[0].iov_base = result.buff[0].addr()
         result.iov[0].iov_len = 1
         result.cmsg = createU(Tcmsghdr, CmsgHandleLen)  
         result.msg.msg_name = nil
@@ -35,201 +38,106 @@ when not defined(windows):
         result.msg.msg_control = result.cmsg
         result.msg.msg_controllen = CmsgHandleLen
 
-    template freeCmsgImpl() = 
-        x.cmsg.dealloc()
+    proc newWriteableHandleMsg(client: AsyncFD): WriteableHandleMsg =
+        handleMsgImpl()
+        result.cmsg.cmsg_len = CmsgHandleLen
+        result.cmsg.cmsg_level = SOL_SOCKET
+        result.cmsg.cmsg_type = SCM_RIGHTS
+        (cast[ptr AsyncFD](CMSG_DATA(result.cmsg)))[] = client
 
-    template lenMsgImpl() =
-        result = 1
+    proc newReadableHandleMsg(): ReadableHandleMsg =
+        handleMsgImpl()
 
-    proc initWriteableFdmsg*(): WriteableFdmsg =
-        fdmsgImpl()
-
-    proc freeCmsg*(x: WriteableFdmsg) =
-        x.cmsg.dealloc()
-
-    proc lenMsg*(x: WriteableFdmsg): int = 
-        result = 1
-
-    proc setHandle*(x: var WriteableFdmsg, fd: AsyncFD) = 
-        x.buff[0] = '0'
-        x.cmsg.cmsg_len = CmsgHandleLen
-        x.cmsg.cmsg_level = SOL_SOCKET
-        x.cmsg.cmsg_type = SCM_RIGHTS
-        (cast[ptr AsyncFD](CMSG_DATA(x.cmsg)))[] = fd
-
-    proc initReadableFdmsg*(): ReadableFdmsg =
-        fdmsgImpl()
-
-    proc freeCmsg*(x: ReadableFdmsg) =
-        freeCmsgImpl()
-
-    proc lenMsg*(x: ReadableFdmsg): int = 
-        lenMsgImpl()
-
-    proc getHandle*(x: var ReadableFdmsg): AsyncFD = 
-        if x.buff[0] == '0':
-            if x.cmsg.cmsg_len == CmsgHandleLen and 
-               x.cmsg.cmsg_level == SOL_SOCKET and
-               x.cmsg.cmsg_type == SCM_RIGHTS:  
-                return (cast[ptr AsyncFD](CMSG_DATA(x.cmsg)))[]
-            else:
-                return AsyncFD(0)
+    proc getHandle(x: ReadableHandleMsg): AsyncFD =
+        if x.cmsg.cmsg_len == CmsgHandleLen and 
+           x.cmsg.cmsg_level == SOL_SOCKET and
+           x.cmsg.cmsg_type == SCM_RIGHTS:  
+            return (cast[ptr AsyncFD](CMSG_DATA(x.cmsg)))[]
         else:
             return AsyncFD(-1)
 
-    type
-        SocketState* = enum  ## State of currently descriptor.
-            ssUnknow = '0', ssLimit = '1', ssAppend = '2', ssClose = '3'
+    proc sendHandle*(fd: AsyncFD, handle: AsyncFD): Future[void] = 
+        var retFuture = newFuture[void]("sendHandle") 
+        var handleMsg = newWriteableHandleMsg(handle)
 
-        Statemsg* = object of RootObj
-            buff: array[1, char]
-
-        WriteableStatemsg* = object of Statemsg
-        ReadableStatemsg* = object of Statemsg 
-
-    template lenMsgImpl() =
-        result = 1
-
-    proc initWriteableStatemsg*(): WriteableStatemsg = discard
-
-    proc lenMsg*(x: WriteableStatemsg): int =
-        lenMsgImpl()
-
-    proc setState*(x: var WriteableStatemsg, state: SocketState) =
-        x.buff[0] = state.char()
-
-    proc initReadableStatemsg*(): ReadableStatemsg = discard
-
-    proc lenMsg*(x: ReadableStatemsg): int =
-        lenMsgImpl()
-
-    proc getState*(x: ReadableStatemsg): SocketState =
-        return case x.buff[0]
-               of ssLimit.char(): ssLimit
-               of ssClose.char(): ssClose
-               of ssAppend.char(): ssAppend
-               else: ssUnknow  
-
-    proc sendHandle*(fd: AsyncFD, handle: AsyncFD, flags = {SocketFlag.SafeDisconn}): Future[void] = 
-        var retFuture = newFuture[void]("sendHandle")
-        var written = 0
-        var fdmsg = initWriteableFdmsg()
-        fdmsg.setHandle(handle)
-        
         proc cb(sock: AsyncFD): bool =
             result = true
-            let netSize = fdmsg.lenMsg() - written
-            let res = sock.SocketHandle().sendmsg(fdmsg.msg.addr(), 0'i32)
+            let res = sock.SocketHandle().sendmsg(handleMsg.msg.addr(), 0'i32)
             if res < 0:
                 let lastError = osLastError()
                 if lastError.int32() notin {EINTR, EWOULDBLOCK, EAGAIN}:
-                    if flags.isDisconnectionError(lastError):
-                        retFuture.complete()
-                        fdmsg.freeCmsg()
-                    else:
-                        retFuture.fail(newException(OSError, osErrorMsg(lastError)))
-                        fdmsg.freeCmsg()
+                    handleMsg.cmsg.dealloc()
+                    retFuture.fail(newException(OSError, osErrorMsg(lastError)))
                 else:
                     result = false
             else:
-                written.inc(res)
-                if res != netSize:
-                    result = false
-                else:
-                    retFuture.complete()
-                    fdmsg.freeCmsg()
-
+                handleMsg.cmsg.dealloc()
+                retFuture.complete() 
+             
         fd.addWrite(cb)
         return retFuture
 
-    proc recvHandle*(fd: AsyncFD, flags = {SocketFlag.SafeDisconn}): Future[AsyncFD] =
-        var retFuture = newFuture[AsyncFD]("recvHandle")
-        var fdmsg = initReadableFdmsg()
-        var readden = 0
+    proc recvHandle*(fd: AsyncFD): Future[AsyncFD] =
+        var 
+            retFuture = newFuture[AsyncFD]("recvHandle") 
+            handleMsg = newReadableHandleMsg()
 
         proc cb(sock: AsyncFD): bool =
             result = true
-            let netSize = fdmsg.lenMsg() - readden
-            let res = sock.SocketHandle().recvmsg(fdmsg.msg.addr(), 0'i32)
+            let res = sock.SocketHandle().recvmsg(handleMsg.msg.addr(), 0'i32)
             if res < 0:
                 let lastError = osLastError()
                 if lastError.int32() notin {EINTR, EWOULDBLOCK, EAGAIN}:
-                    if flags.isDisconnectionError(lastError):                      
-                        retFuture.complete(AsyncFD(-1))
-                        fdmsg.freeCmsg()
-                    else:
-                        retFuture.fail(newException(OSError, osErrorMsg(lastError)))
-                        fdmsg.freeCmsg()
+                    handleMsg.cmsg.dealloc()
+                    retFuture.fail(newException(OSError, osErrorMsg(lastError)))
                 else:
                     result = false
-            elif res == 0:
-                retFuture.complete(AsyncFD(-1))
             else:
-                readden.inc(res)
-                if res != netSize:
-                    result = false
-                else:
-                    retFuture.complete(fdmsg.getHandle())
-                    fdmsg.freeCmsg()
+                retFuture.complete(handleMsg.getHandle()) 
+                handleMsg.cmsg.dealloc()
 
         fd.addRead(cb)
         return retFuture
 
-    proc sendState*(fd: AsyncFD, state: SocketState, flags = {SocketFlag.SafeDisconn}): Future[void] =
+    proc sendState*(fd: AsyncFD, state: HandleState): Future[void] =
         var retFuture = newFuture[void]("sendState")
-        var written = 0
-        var statemsg = initWriteableStatemsg()
-        statemsg.setState(state)
+        var buff = [state.char()]
         
         proc cb(sock: AsyncFD): bool =
             result = true
-            let netSize = statemsg.lenMsg() - written
-            let res = sock.SocketHandle().send(statemsg.buff[0].addr(), netSize, 0'i32)
+            let res = sock.SocketHandle().send(buff[0].addr(), 1'i32, 0'i32)
             if res < 0:
                 let lastError = osLastError()
                 if lastError.int32() notin {EINTR, EWOULDBLOCK, EAGAIN}:
-                    if flags.isDisconnectionError(lastError):
-                        retFuture.complete()
-                    else:
-                        retFuture.fail(newException(OSError, osErrorMsg(lastError)))
+                    retFuture.fail(newException(OSError, osErrorMsg(lastError)))
                 else:
                     result = false
             else:
-                written.inc(res)
-                if res != netSize:
-                    result = false
-                else:
-                    retFuture.complete()
+                retFuture.complete() 
 
         fd.addWrite(cb)
         return retFuture
 
-    proc recvState*(fd: AsyncFD, flags = {SocketFlag.SafeDisconn}): Future[SocketState] =
-        var retFuture = newFuture[SocketState]("recvState")
-        var statemsg = initReadableStatemsg()
-        var readden = 0
+    proc recvState*(fd: AsyncFD): Future[HandleState] =
+        var retFuture = newFuture[HandleState]("recvState")
+        var buff: array[1, char]
 
         proc cb(sock: AsyncFD): bool =
             result = true
-            let netSize = statemsg.lenMsg() - readden
-            let res = sock.SocketHandle().recv(statemsg.buff[0].addr(), netSize, 0'i32)
+            let res = sock.SocketHandle().recv(buff[0].addr(), 1'i32, 0'i32)
             if res < 0:
                 let lastError = osLastError()
                 if lastError.int32() notin {EINTR, EWOULDBLOCK, EAGAIN}:
-                    if flags.isDisconnectionError(lastError):
-                        retFuture.complete(ssUnknow)
-                    else:
-                        retFuture.fail(newException(OSError, osErrorMsg(lastError)))
+                    retFuture.fail(newException(OSError, osErrorMsg(lastError)))
                 else:
                     result = false
-            elif res == 0:
-                retFuture.complete(ssUnknow)
             else:
-                readden.inc(res)
-                if res != netSize:
-                    result = false
-                else:
-                    retFuture.complete(statemsg.getState())
+                var state = case buff[0]
+                            of hsLimit.char(): hsLimit
+                            of hsClose.char(): hsClose
+                            of hsAppend.char(): hsAppend
+                            else: hsUnknow 
+                retFuture.complete(state)
 
         fd.addRead(cb)
         return retFuture
@@ -238,17 +146,14 @@ when not defined(windows) and isMainModule:
     from rawsockets import setBlocking
 
     proc recvHandleAlways(fd: AsyncFD) {.async.} =
-        var i = 0
         while true:
-            var sockfd = await fd.recvhandle()
-            i.inc()
-            if sockfd == AsyncFD(-1):
-                asyncCheck fd.sendState(ssUnknow)
-            elif sockfd == AsyncFD(0):
-                asyncCheck fd.sendState(ssLimit)
+            var handle = await fd.recvhandle()
+            case handle
+            of AsyncFD(-1):
+                asyncCheck fd.sendState(hsLimit)
             else:
-                asyncCheck fd.sendState(ssClose)
-                sockfd.closeSocket()
+                asyncCheck fd.sendState(hsClose)
+                handle.closeSocket()
 
     proc recvStateAlways(fd: AsyncFD) {.async.} =
         var i = 0
@@ -256,23 +161,26 @@ when not defined(windows) and isMainModule:
             var state = await fd.recvState()
             i.inc()
             case state
-            of ssUnknow: echo "unknow ", i
-            of ssLimit: echo "limit ", i
-            of ssAppend: echo "append ", i
-            of ssClose: echo "close ", i
+            of hsUnknow: echo "unknow ", i
+            of hsLimit: echo "limit ", i
+            of hsAppend: echo "append ", i
+            of hsClose: echo "close ", i
+
+    proc sendHandleAndClose(fd: AsyncFD, handle: AsyncFD) {.async.} =
+        await fd.sendHandle(handle)
+        discard handle.SocketHandle().close()
 
     proc sendHandleColl(fd: AsyncFD) {.async.} =
         for i in 1..500:
-            asyncCheck fd.sendHandle(socketpair().pipefd1)
+            asyncCheck fd.sendHandleAndClose(socketpair().pipefd1)
 
     var (afd, bfd) = socketpair()
     afd.register()
     bfd.register()
     afd.SocketHandle().setBlocking(false)
     bfd.SocketHandle().setBlocking(false)
-
     asyncCheck bfd.recvHandleAlways()
     asyncCheck afd.recvStateAlways()
     asyncCheck afd.sendHandleColl()
-
+    
     runForever()
