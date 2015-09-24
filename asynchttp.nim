@@ -77,6 +77,76 @@ proc `==`*(protocol: tuple[orig: string, major, minor: int],
         of HttpVer10: 0
     result = protocol.major == major and protocol.minor == minor
 
+proc addHeaders(msg: var string, headers: StringTableRef) =
+    for k, v in headers: msg.add(k & ": " & v & "\c\L")
+
+proc sendHeaders*(req: Request, headers: StringTableRef): Future[void] =
+    ## Sends the specified headers to the requesting client.
+    var msg = ""
+    msg.addHeaders(headers)
+    return req.client.send(msg)
+
+proc send*(req: Request, code: HttpCode, content: string,
+           headers: StringTableRef = nil): Future[void] =
+    ## Responds to the request with the specified ``HttpCode``, headers and
+    ## content.
+    ##
+    ## This procedure will **not** close the client socket.
+    var msg = "HTTP/1.1 " & $code & "\c\L"
+
+    if headers != nil: msg.addHeaders(headers)
+    msg.add("Content-Length: " & $content.len() & "\c\L\c\L")
+    msg.add(content)
+    result = req.client.send(msg)
+
+proc parseHeader(line: string): tuple[key, value: string] =
+    var i = 0
+    i = line.parseUntil(result.key, ':')
+    i.inc() # skip :
+    if i < line.len():
+        i += line.skipWhiteSpace(i)
+        i += line.parseUntil(result.value, {'\c', '\L'}, i)
+    else:
+        result.value = ""
+
+proc parseProtocol(protocol: string): tuple[orig: string, major, minor: int] =
+    var i = protocol.skipIgnoreCase("HTTP/")
+    if i != 5:
+        raise newException(ValueError, 
+                           "Invalid request protocol. Got: " & protocol)
+    result.orig = protocol
+    i.inc(protocol.parseInt(result.major, i))
+    i.inc() # Skip .
+    i.inc(protocol.parseInt(result.minor, i))
+
+proc sendStatus(client: AsyncSocket, status: string): Future[void] =
+    client.send("HTTP/1.1 " & status & "\c\L")
+
+proc recvLineInto(socket: AsyncSocket, resString: FutureVar[string], timeout = 0,
+                  flags = {SocketFlag.SafeDisconn}): Future[bool] {.async.} =
+    let recvFut = socket.recvLineInto(resString, flags)
+    if timeout <= 0:
+        await recvFut
+        result = true
+    else:
+        await sleepAsync(timeout) or recvFut
+        result = if recvFut.finished: true else: false
+
+proc recv(socket: AsyncSocket, resString: ptr string, size: int, timeout = 0,
+          flags = {SocketFlag.SafeDisconn}): Future[bool] {.async.} =
+    let recvFut = socket.recv(size, flags)
+    if timeout <= 0:
+        await recvFut
+        resString[] = recvFut.read()
+        result = true
+    else:
+        await sleepAsync(timeout) or recvFut
+        if recvFut.finished:
+            resString[] = recvFut.read()
+            result = true
+        else:
+            result = false
+
 proc on*(x: var AsyncHttpServer, 
          name: string, p: proc(e: Request): Future[void] {.closure.}) {.inline.} =
     x.emitter.on(name, p)
@@ -127,51 +197,6 @@ proc newAsyncHttpServer*(reuseAddr = true, readTimeout = 0): AsyncHttpServer =
     else:
         result.socket = newAsyncSocket()
 
-proc addHeaders(msg: var string, headers: StringTableRef) =
-    for k, v in headers: msg.add(k & ": " & v & "\c\L")
-
-proc sendHeaders*(req: Request, headers: StringTableRef): Future[void] =
-    ## Sends the specified headers to the requesting client.
-    var msg = ""
-    msg.addHeaders(headers)
-    return req.client.send(msg)
-
-proc send*(req: Request, code: HttpCode, content: string,
-           headers: StringTableRef = nil): Future[void] =
-    ## Responds to the request with the specified ``HttpCode``, headers and
-    ## content.
-    ##
-    ## This procedure will **not** close the client socket.
-    var msg = "HTTP/1.1 " & $code & "\c\L"
-
-    if headers != nil: msg.addHeaders(headers)
-    msg.add("Content-Length: " & $content.len() & "\c\L\c\L")
-    msg.add(content)
-    result = req.client.send(msg)
-
-proc parseHeader(line: string): tuple[key, value: string] =
-    var i = 0
-    i = line.parseUntil(result.key, ':')
-    i.inc() # skip :
-    if i < line.len():
-        i += line.skipWhiteSpace(i)
-        i += line.parseUntil(result.value, {'\c', '\L'}, i)
-    else:
-        result.value = ""
-
-proc parseProtocol(protocol: string): tuple[orig: string, major, minor: int] =
-    var i = protocol.skipIgnoreCase("HTTP/")
-    if i != 5:
-        raise newException(ValueError, 
-                           "Invalid request protocol. Got: " & protocol)
-    result.orig = protocol
-    i.inc(protocol.parseInt(result.major, i))
-    i.inc() # Skip .
-    i.inc(protocol.parseInt(result.minor, i))
-
-proc sendStatus(client: AsyncSocket, status: string): Future[void] =
-    client.send("HTTP/1.1 " & status & "\c\L")
-
 proc processClient(server: AsyncHttpServer, client: AsyncSocket, address: string) {.async.} =
     var request: Request
     request.url = initUri()
@@ -179,6 +204,7 @@ proc processClient(server: AsyncHttpServer, client: AsyncSocket, address: string
     var lineFut = newFutureVar[string]("asynchttpserver.processClient")
     lineFut.mget() = newStringOfCap(80)
     var key, value = ""
+    var readState = false
 
     await server.emitter.emit("connection", request)
 
@@ -192,11 +218,14 @@ proc processClient(server: AsyncHttpServer, client: AsyncSocket, address: string
         assert client != nil
         request.client = client
 
+        request.errorMsg = nil
+        request.params = nil
+
         # First line - GET /path HTTP/1.1
         lineFut.mget().setLen(0)
         lineFut.clean()
-        await client.recvLineInto(lineFut) # TODO: Timeouts.
-        if lineFut.mget == "":
+        readState = await client.recvLineInto(lineFut, server.readTimeout) # TODO: Timeouts.
+        if not readState or lineFut.mget == "":
             client.close()
             await server.emitter.emit("end", request)
             return
@@ -226,9 +255,9 @@ proc processClient(server: AsyncHttpServer, client: AsyncSocket, address: string
             i = 0
             lineFut.mget.setLen(0)
             lineFut.clean()
-            await client.recvLineInto(lineFut)
+            readState = await client.recvLineInto(lineFut, server.readTimeout)
 
-            if lineFut.mget == "":
+            if not readState or lineFut.mget == "":
                 client.close(); 
                 await server.emitter.emit("end", request)
                 return
@@ -256,7 +285,11 @@ proc processClient(server: AsyncHttpServer, client: AsyncSocket, address: string
                     await server.emitter.emit("clientError", request)
                     continue
                 else:
-                    request.body = await client.recv(contentLength)
+                    readState = await client.recv(request.body.addr(), contentLength, server.readTimeout)
+                    if not readState:
+                        client.close()
+                        await server.emitter.emit("end", request)
+                        return
                     assert request.body.len == contentLength
             else:
                 request.errorMsg = "Bad Request. No Content-Length."

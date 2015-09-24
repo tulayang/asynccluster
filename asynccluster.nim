@@ -67,7 +67,7 @@ when not defined(windows):
             else:
                 cluster.connections.dec(worker.connections)
                 worker.restartProcess()
-                echo "restart"
+                echo ">>> restart"
                 return worker
 
     proc recvStateAlways(cluster: AsyncCluster, index: int) {.async.} =
