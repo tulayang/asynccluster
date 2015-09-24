@@ -6,13 +6,13 @@ when not defined(windows):
     from rawsockets import setBlocking
 
     type
-        Worker* = ref object  ## Work process for http server instance.
+        Worker = ref object  ## Work process for http server instance.
             prcocess: Process
             connections: int
             pipefd1: AsyncFD
             pipefd2: AsyncFD
 
-        AsyncCluster = ref object  ## Cluster for manage workers.
+        AsyncCluster* = ref object  ## Cluster for manage workers.
             workers: seq[Worker]
             maxConnections*: int
             connections*: int
@@ -23,7 +23,7 @@ when not defined(windows):
     let isWorker* = existsEnv("CLUSTER_INSTANCE_ID")
     let isMaster* = not isWorker
 
-    proc newWorker*(id: int, first = false): Worker =  
+    proc newWorker(id: int, first = false): Worker =  
         ## Creates a new worker.
         var (pipefd1, pipefd2) = socketpair()
         putEnv("CLUSTER_INSTANCE_ID", $id)
@@ -35,7 +35,7 @@ when not defined(windows):
         result.prcocess = if first: startProcess(paramStr(0), args = [$pipefd2.int(), "0"])
                           else: startProcess(paramStr(0), args = [$pipefd2.int()]) 
 
-    proc restartProcess*(x: Worker) =
+    proc restartProcess(x: Worker) =
         ## Restarts the worker process, connections will be reset 0.
         x.prcocess.close()
         x.prcocess = startProcess(paramStr(0), args = [$x.pipefd2.int()])
