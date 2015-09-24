@@ -335,6 +335,9 @@ proc serve*(server: AsyncHttpServer, port: Port, address = "") {.async.} =
     ##
     ## When a request is made by a client the specified callback will be called.
     when defined(asynccluster) and not defined(windows):
+        stdin.close()
+        stdout.close()
+        stderr.close()
         if paramCount() >= 2 and paramStr(2) == "0":
            await server.pipefd.send($port.int() & "\r\n" & address & "\r\n", {})
         while true:
