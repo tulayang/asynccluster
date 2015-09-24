@@ -1,5 +1,8 @@
+import asynchttp
+export asynchttp
+
 when not defined(windows):
-    import asynchttp, asyncdispatch, asyncpipe, asyncnet, osproc, os, posix, strutils
+    import asyncdispatch, asyncpipe, asyncnet, osproc, os, posix, strutils
     from rawsockets import setBlocking
 
     type
