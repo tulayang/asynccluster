@@ -123,7 +123,7 @@ proc serve(server: AsyncServer, port: Port, address = "") {.async.} =
             asyncCheck processClient(server, newClient(clientHandle), "")
 
 if isMaster:  # In master process.
-    forkWorkers(getCluster(), 6)  # Instances 6 worker servers.
+    forkWorkers(getCluster(), 6)  # Instantiates 6 worker servers.
     runForever()
 else:  # In worker process.
     var server = newAsyncServer()
