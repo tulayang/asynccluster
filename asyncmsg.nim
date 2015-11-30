@@ -75,7 +75,7 @@ when not defined(windows):
 
         proc cb(sock: AsyncFD): bool =
             result = true
-            let hmsg = createWriteableHmsg(handle)
+            var hmsg = createWriteableHmsg(handle)
             let res = sendmsg(SocketHandle(sock), addr(hmsg.msg), cint(0))
             if res == -1:
                 let lastError = osLastError()

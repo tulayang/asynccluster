@@ -1,21 +1,33 @@
+## This module implements multi-process support for asynchronous 
+## server. Howerer, this just a toy and does not provide any 
+## promise. 
+## 
+## This module has made an independent abstraction of multi-process 
+## management, but did'nt provide any server implementation. User
+## should implement an asynchronous server, and follow some 
+## conventions of the module. See test example.
+## 
+## Expecting official multi-process support.
+
 when not defined(windows):
     import asyncdispatch, asyncnet, nativesockets, net, asyncmsg
     import posix, os, osproc, strutils, strtabs
+    export asyncmsg
 
     type
-        PassSetting = object
+        PassSetting* = object  # An object of settings for pass when server first start.
             maxConnections: int
             port: Port
             reuseAddr: bool
             address: string
 
-        Worker = object
+        Worker = object  # Worker manager.
             id: int
             connections: int
             process: Process
             pipe: tuple[fd1: AsyncPipeFD, fd2: AsyncPipeFD]            
 
-        Cluster = ref object
+        Cluster = ref object  # Cluster manager.
             maxConnections: int
             connections: int
             sockTimeout: int
@@ -29,14 +41,22 @@ when not defined(windows):
     var workerId = 0
     var cluster: Cluster
 
-    proc toLine(P: PassSetting): string =
+    proc initPassSetting*(maxConnections: int, port: Port, reuseAddr: bool, address: string): PassSetting =
+        result.maxConnections = maxConnections
+        result.port = port
+        result.reuseAddr = reuseAddr
+        result.address = address
+
+    proc toLine*(P: PassSetting): string =
+        ## Converts a PassSetting to a string, then pass it to cluster server.
         result = $P.maxConnections & '|' & 
                  $int(P.port) & '|' & 
                  (if P.reuseAddr: '1' else: '0') & '|' & 
                  P.address & 
                  "\r\n" 
 
-    proc toPassSetting(s: string): PassSetting =
+    proc toPassSetting*(s: string): PassSetting =
+        ## Converts a string to a PassSetting which is used to config cluster server.
         let sq = split(s, '|')
         result.maxConnections = parseInt(sq[0])
         result.port = Port(parseInt(sq[1]))
@@ -175,6 +195,7 @@ when not defined(windows):
                 await sleepAsync(0)    
 
     proc forkWorkers*(c: Cluster, n: Natural) =
+        ## Instances `n` worker servers.
         for i in 0..<n: 
             var worker = initWorker(workerId)
             if workerId == 0:
@@ -234,10 +255,8 @@ when not defined(windows) and isMainModule:
 
     proc serve(server: AsyncServer, port: Port, address = "") {.async.} =
         if getEnv("CLUSTER_INSTANCE_INIT") == "ON":
-            await sendSetting(server, PassSetting(maxConnections: server.maxConnections,
-                                                  port: port, 
-                                                  reuseAddr: server.reuseAddr,
-                                                  address: address))
+            await sendSetting(server, initPassSetting(server.maxConnections,
+                port, server.reuseAddr, address))
         while true:
             var clientHandle = await recvHandle(server)
             case clientHandle
