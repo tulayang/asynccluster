@@ -26,7 +26,7 @@ The worker manager abstraction, which to start and restart child process, transf
 
 * id               - No.
 * process          - The worker process.
-* pipe             - Pipe pair. The `fd1` is used by the master server, and the `fd2` is copied to the worker server.
+* pipe             - 
 * connections      - Current connections.
 
 * initWorker()     - Init.
@@ -39,7 +39,7 @@ The worker manager abstraction, which to start and restart child process, transf
 * sendHandle()     - Send a client descriptor via a pipe.
 * recvState()      - Recv a state of a client descriptor via a pipe.
 * recvSetting()    - Recv a `PassSetting` via a pipe.
-* running()        - The worker processes are still running ?
+* running()        - The worker process is still running ?
 
 ## Cluster
 
