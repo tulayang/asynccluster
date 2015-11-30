@@ -26,7 +26,7 @@ The worker manager abstraction, which to start and restart child process, transf
 
 * id - No.
 * process - The worker process.
-* pipe - Pipe pair. The `fd1` is used by the master server, and the `fd2` is copied to the worker server.
+* pipe - Pipe pair. The fd1 is used by the master server, and the fd2 is copied to the worker server.
 * connections - Current connections.
 
 * initWorker()     - Init.
