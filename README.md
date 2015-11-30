@@ -24,13 +24,12 @@ Expecting official multi-process support.
 
 The worker manager abstraction, which to start and restart child process, transfer client descriptors, receive the states of client descriptors.
 
-* id - No.
-* process - The worker process.
-* pipe - Pipe pair. The fd1 is used by the master server, and the fd2 is copied to the worker server. 
-* connections - Current connections. 
-
-* initWorker() - Init. 
-* initEnvTable() - Init environment variable of worker process.
+* id               - No.
+* process          - The worker process.
+* pipe             - Pipe pair. The `fd1` is used by the master server, and the `fd2` is copied to the worker server.
+* connections      - Current connections.
+* initWorker()     - Init.
+* initEnvTable()   - Init environment variable of worker process.
 * startPrc()       - Start worker process.
 * restartPrc()     - Restart worker process.
 * connections()    - Get current connections.
@@ -50,8 +49,7 @@ The cluster manager abstraction, which to select a worker to process a client re
 * sockTimeout       - 
 * socket            - Server socket.
 * reuseAddr         - 
-* workers - Workers sequence.
-
+* workers           - Workers sequence.
 * getCluster()      - Return the cluster manager.
 * forkWorkers()     - Instantiates worker servers.
 * acceptClient()    - Accept client requests.
